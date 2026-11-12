@@ -1,0 +1,353 @@
+# Coloque este arquivo em: .github/workflows/build.yml
+# Depois: aba Actions > "Build APK" > Run workflow. O APK aparece em Releases.
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Gerar projeto Android
+        run: |
+          mkdir -p app/src/main/java/app/cursoia app/src/main/assets
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "CursoIA"
+          include ":app"
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+            id 'com.android.application' version '8.5.2' apply false
+            id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+          echo "android.useAndroidX=true" > gradle.properties
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+          android {
+            namespace 'app.cursoia'
+            compileSdk 34
+            defaultConfig { applicationId 'app.cursoia'; minSdk 26; targetSdk 34; versionCode 2; versionName '2.0' }
+            compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+            kotlinOptions { jvmTarget = '17' }
+          }
+          dependencies { implementation 'androidx.security:security-crypto:1.1.0-alpha06' }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <application android:label="Curso IA" android:allowBackup="false"
+              android:usesCleartextTraffic="false"
+              android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true"
+                android:windowSoftInputMode="adjustResize"
+                android:configChanges="orientation|screenSize|keyboardHidden">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/app/cursoia/MainActivity.kt <<'KT'
+          package app.cursoia
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.webkit.*
+          import androidx.security.crypto.EncryptedSharedPreferences
+          import androidx.security.crypto.MasterKey
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          // Segurança: só INTERNET. Sem acesso a arquivos, contatos, apps ou banco.
+          // Rede: só os destinos da lista abaixo. Kiwify é somente leitura (GET) + login OAuth.
+          class MainActivity : Activity() {
+            private lateinit var wv: WebView
+            private val HOSTS = setOf("text.pollinations.ai", "gen.pollinations.ai",
+              "suggestqueries.google.com", "pt.wikipedia.org", "public-api.kiwify.com")
+            private val SHOP = Regex("^[a-z0-9][a-z0-9-]*\\.myshopify\\.com$")
+            private val prefs by lazy {
+              EncryptedSharedPreferences.create(
+                this, "cofre",
+                MasterKey.Builder(this).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
+            }
+
+            inner class Ponte {
+              @JavascriptInterface fun ler(k: String): String = prefs.getString(k, "") ?: ""
+              @JavascriptInterface fun gravar(k: String, v: String) { prefs.edit().putString(k, v).apply() }
+              @JavascriptInterface fun http(id: String, metodo: String, url: String, headers: String, corpo: String) {
+                Thread {
+                  val saida = try {
+                    val u = URL(url)
+                    val host = u.host.lowercase()
+                    val shop = SHOP.matches(host)
+                    if (u.protocol != "https" || !(host in HOSTS || shop)) throw Exception("Destino bloqueado: $host")
+                    if (host == "public-api.kiwify.com" && metodo != "GET" && !u.path.endsWith("/oauth/token"))
+                      throw Exception("Ação bloqueada: Kiwify é somente leitura")
+                    if (shop && !u.path.startsWith("/admin/api/")) throw Exception("Caminho bloqueado na Shopify")
+                    val c = u.openConnection() as HttpURLConnection
+                    c.requestMethod = metodo; c.connectTimeout = 30000; c.readTimeout = 240000
+                    c.instanceFollowRedirects = false
+                    val h = JSONObject(headers)
+                    h.keys().forEach { c.setRequestProperty(it, h.getString(it)) }
+                    if (corpo.isNotEmpty()) { c.doOutput = true; c.outputStream.use { it.write(corpo.toByteArray()) } }
+                    val s = if (c.responseCode < 400) c.inputStream else c.errorStream
+                    JSONObject().put("status", c.responseCode).put("body", s?.bufferedReader()?.readText() ?: "").toString()
+                  } catch (e: Exception) {
+                    JSONObject().put("status", 0).put("body", e.message ?: "Falha de rede").toString()
+                  }
+                  runOnUiThread {
+                    wv.evaluateJavascript("window.retorno(" + JSONObject.quote(id) + "," + JSONObject.quote(saida) + ")", null)
+                  }
+                }.start()
+              }
+            }
+
+            @SuppressLint("SetJavaScriptEnabled")
+            override fun onCreate(b: Bundle?) {
+              super.onCreate(b)
+              window.statusBarColor = Color.parseColor("#12101F")
+              window.navigationBarColor = Color.parseColor("#12101F")
+              wv = WebView(this)
+              wv.setBackgroundColor(Color.parseColor("#12101F"))
+              wv.settings.apply {
+                javaScriptEnabled = true; domStorageEnabled = true
+                allowFileAccess = false; allowContentAccess = false
+                setGeolocationEnabled(false)
+              }
+              wv.webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest) = true
+              }
+              wv.addJavascriptInterface(Ponte(), "Android")
+              setContentView(wv)
+              wv.loadUrl("file:///android_asset/index.html")
+            }
+
+            override fun onBackPressed() { moveTaskToBack(true) }
+          }
+          KT
+          cat > app/src/main/assets/index.html <<'HTML'
+          <!doctype html>
+          <html lang="pt-BR"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+          <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
+          <style>
+          :root{--bg:#12101F;--sf:#1C1932;--sf2:#26224A;--tx:#F1EFFA;--mut:#9C98BD;--ac:#F5B544;--pe:#8B93FF;--ok:#5BD6A3;--er:#FF7A8A}
+          *{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent}
+          html,body{height:100%;background:var(--bg);color:var(--tx);font:16px/1.5 system-ui,sans-serif}
+          #app{display:flex;flex-direction:column;height:100%}
+          header{padding:14px 18px 10px;display:flex;align-items:baseline;gap:10px}
+          header h1{font:700 22px Georgia,serif;letter-spacing:-.3px}
+          header span{color:var(--ac);font-size:13px}
+          main{flex:1;overflow-y:auto;padding:4px 16px 16px}
+          nav{display:flex;background:var(--sf);border-top:1px solid var(--sf2);padding-bottom:env(safe-area-inset-bottom)}
+          nav button{flex:1;background:none;border:0;color:var(--mut);padding:12px 2px;font-size:12.5px}
+          nav button.on{color:var(--ac);font-weight:600}
+          .msg{max-width:88%;padding:11px 14px;margin:8px 0;border-radius:16px;white-space:pre-wrap;word-wrap:break-word}
+          .u{background:var(--pe);color:#0d0b1c;margin-left:auto;border-bottom-right-radius:4px}
+          .a{background:var(--sf);border-bottom-left-radius:4px}
+          .bar{display:flex;gap:8px;padding:10px 0 0}
+          textarea,input,select{width:100%;background:var(--sf);color:var(--tx);border:1px solid var(--sf2);border-radius:12px;padding:12px;font:inherit}
+          textarea{resize:none;max-height:120px}
+          button.go{background:var(--ac);color:#241a00;border:0;border-radius:12px;padding:12px 16px;font-weight:700;font-size:15px}
+          button.go:disabled{opacity:.5}
+          button.sec{background:var(--sf2);color:var(--tx);border:0;border-radius:10px;padding:10px 12px;font-size:14px}
+          .card{background:var(--sf);border-radius:16px;padding:16px;margin:10px 0}
+          .card h3{font:700 18px Georgia,serif;margin-bottom:4px}
+          .mut{color:var(--mut);font-size:14px}
+          .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center}
+          .chip{background:var(--sf2);border-radius:20px;padding:6px 12px;font-size:13px;color:var(--mut)}
+          .chip.on{background:var(--ac);color:#241a00;font-weight:600}
+          label{display:block;margin:14px 0 6px;font-weight:600}
+          .price{color:var(--ac);font:700 24px Georgia,serif}
+          .err{color:var(--er)} .ok{color:var(--ok)}
+          details{margin-top:8px} summary{padding:8px 0;font-weight:600}
+          .pulse{animation:p 1.2s infinite} @keyframes p{50%{opacity:.4}}
+          @media(prefers-reduced-motion:reduce){.pulse{animation:none}}
+          </style></head><body>
+          <div id="app">
+            <header><h1>Curso IA</h1><span>100% gratuito</span></header>
+            <main id="main"></main>
+            <nav id="nav"></nav>
+          </div>
+          <script>
+          const $=s=>document.querySelector(s);
+          const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+          const A=window.Android;
+          const S={tab:'chat',chat:[],web:true,busy:false,cursos:[],log:'',loja:''};
+          try{S.cursos=JSON.parse(localStorage.getItem('cursos')||'[]')}catch(e){}
+          try{S.chat=JSON.parse(localStorage.getItem('chat')||'[]')}catch(e){}
+          const save=()=>{try{localStorage.setItem('cursos',JSON.stringify(S.cursos));localStorage.setItem('chat',JSON.stringify(S.chat.slice(-40)))}catch(e){}};
+
+          // ---------- Rede (tudo passa pela ponte nativa com lista de destinos permitidos) ----------
+          const pend={};
+          window.retorno=(id,t)=>{const p=pend[id];delete pend[id];let r;try{r=JSON.parse(t)}catch(e){r={status:0,body:String(t)}}p(r)};
+          const http=(m,u,h={},b='')=>new Promise(ok=>{const id=Math.random().toString(36).slice(2);pend[id]=ok;A.http(id,m,u,JSON.stringify(h),b)});
+
+          // ---------- IA gratuita (Pollinations, sem chave) ----------
+          const SYS=`Você é o Curso IA, especialista em criar infoprodutos ORIGINAIS para vender no Brasil.
+          Regras: nunca copie conteúdo de terceiros (cursos, aulas, textos ou nomes); use tendências só como inspiração e crie algo novo, com método próprio.
+          Todo conteúdo deve ser útil e verdadeiro. Não prometa ganhos garantidos; não invente depoimentos nem números. Preços acessíveis (R$ 19 a R$ 97). Responda em português do Brasil.`;
+          async function ia(msgs){
+            const url=A.ler('ia')||'https://text.pollinations.ai/openai';
+            const h={'Content-Type':'application/json'};const k=A.ler('pkey');if(k)h.Authorization='Bearer '+k;
+            const r=await http('POST',url,h,JSON.stringify({model:'openai',messages:[{role:'system',content:SYS},...msgs]}));
+            if(r.status<200||r.status>=300)throw new Error('IA gratuita indisponível ('+r.status+'). Tente de novo ou troque o servidor em Ajustes.');
+            try{return JSON.parse(r.body).choices[0].message.content}catch(e){throw new Error('Resposta inesperada da IA gratuita.')}}
+          const json=t=>{const m=String(t).match(/\{[\s\S]*\}/);if(!m)throw new Error('JSON ausente');return JSON.parse(m[0])};
+
+          // ---------- Pesquisa gratuita: buscas reais do Google + Wikipédia ----------
+          async function sugestoes(q){const r=await http('GET','https://suggestqueries.google.com/complete/search?client=firefox&hl=pt-BR&q='+encodeURIComponent(q));try{return JSON.parse(r.body)[1]||[]}catch(e){return[]}}
+          async function wiki(q){const r=await http('GET','https://pt.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*&srlimit=3&srsearch='+encodeURIComponent(q));
+            try{return JSON.parse(r.body).query.search.map(s=>s.title+': '+s.snippet.replace(/<[^>]+>/g,'')).join('\n')}catch(e){return''}}
+          async function pesquisar(t){
+            const s=[...new Set((await Promise.all([t,'como '+t,'curso de '+t,t+' para iniciantes'].map(sugestoes))).flat())].slice(0,20);
+            return `Buscas reais no Google Brasil (mostram a demanda):\n- ${s.join('\n- ')}\n\nContexto (Wikipédia):\n${await wiki(t)}`}
+
+          // ---------- Criação ----------
+          async function criar(tema,pesq){
+            const p=`Tema: ${tema}\nPesquisa de demanda:\n${pesq}\n\nCrie um curso ORIGINAL com ângulo próprio, baseado nas dúvidas reais das buscas. Devolva SOMENTE um JSON neste formato:
+          {"titulo":"","subtitulo":"","publico":"","promessa":"(realista, sem garantia de ganhos)","preco":47,"modulos":[{"nome":"","aulas":[{"titulo":"","resumo":"","roteiro":"(roteiro da aula, 100-200 palavras)"}]}],"bonus":[""],"pagina_vendas":"(copy persuasiva e honesta com benefícios, para quem é, garantia de 7 dias e chamada para ação)","faq":[{"p":"","r":""}],"anuncios":["(3 textos curtos)"]}
+          Use 3 módulos com 3 aulas cada.`;
+            let c,e;for(let i=0;i<2&&!c;i++){try{c=json(await ia([{role:'user',content:p}]))}catch(x){e=x}}
+            if(!c)throw new Error('A IA gratuita não devolveu um curso válido. Tente novamente.');
+            c.id=Date.now()+Math.random().toString(36).slice(2,5);c.tema=tema;c.data=new Date().toLocaleDateString('pt-BR');return c}
+          const preco=c=>Number(String(c.preco).replace(',','.').replace(/[^\d.]/g,''))||47;
+          function textoCurso(c){
+            let s=`${c.titulo}\n${c.subtitulo}\n\nPúblico: ${c.publico}\nPromessa: ${c.promessa}\nPreço sugerido: R$ ${preco(c)}\n\n`;
+            (c.modulos||[]).forEach((m,i)=>{s+=`MÓDULO ${i+1}: ${m.nome}\n`;(m.aulas||[]).forEach((a,j)=>{s+=`\n Aula ${i+1}.${j+1} - ${a.titulo}\n ${a.roteiro}\n`});s+='\n'});
+            s+=`BÔNUS:\n- ${(c.bonus||[]).join('\n- ')}\n\nPÁGINA DE VENDAS:\n${c.pagina_vendas}\n\nFAQ:\n`;
+            (c.faq||[]).forEach(f=>s+=`P: ${f.p}\nR: ${f.r}\n\n`);s+=`ANÚNCIOS:\n- ${(c.anuncios||[]).join('\n- ')}`;return s}
+          const htmlCurso=c=>`<p>${esc(c.subtitulo)}</p><div>${esc(c.pagina_vendas).replace(/\n/g,'<br>')}</div><h3>Conteúdo</h3><ul>${(c.modulos||[]).map(m=>`<li><b>${esc(m.nome)}</b><ul>${(m.aulas||[]).map(a=>`<li>${esc(a.titulo)}</li>`).join('')}</ul></li>`).join('')}</ul>`;
+          function copiar(txt){const t=document.createElement('textarea');t.value=txt;t.style.cssText='position:fixed;opacity:0';document.body.appendChild(t);t.select();try{document.execCommand('copy');toast('Copiado')}catch(e){toast('Não foi possível copiar')}t.remove()}
+          function toast(m){const d=document.createElement('div');d.textContent=m;d.style.cssText='position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:var(--ac);color:#241a00;padding:10px 18px;border-radius:20px;font-weight:600;z-index:9;max-width:90%;text-align:center';document.body.appendChild(d);setTimeout(()=>d.remove(),2600)}
+
+          // ---------- Kiwify (somente leitura) ----------
+          let KT=null;
+          async function kiwToken(){if(KT&&KT.exp>Date.now())return KT.t;const id=A.ler('kid'),sec=A.ler('ksec');
+            if(!id||!sec)throw new Error('Cadastre client_id e client_secret da Kiwify em Ajustes.');
+            const r=await http('POST','https://public-api.kiwify.com/v1/oauth/token',{'Content-Type':'application/x-www-form-urlencoded'},'client_id='+encodeURIComponent(id)+'&client_secret='+encodeURIComponent(sec));
+            if(r.status!==200)throw new Error('A Kiwify recusou as credenciais ('+r.status+').');
+            KT={t:JSON.parse(r.body).access_token,exp:Date.now()+3.5e6};return KT.t}
+          async function kiw(path){const h={Authorization:'Bearer '+await kiwToken()};const a=A.ler('kacc');if(a)h['x-kiwify-account-id']=a;
+            const r=await http('GET','https://public-api.kiwify.com/v1'+path,h);
+            if(r.status<200||r.status>299)throw new Error('Kiwify '+r.status+': '+String(r.body).slice(0,140));return JSON.parse(r.body)}
+          const lista=j=>j.data||j.results||j.products||j.items||(Array.isArray(j)?j:[]);
+          async function painelKiwify(){S.busy=true;S.loja='Consultando a Kiwify...';render();
+            try{const f=new Date(),i=new Date(Date.now()-30*864e5);const d=x=>x.toISOString().slice(0,10);
+              const [p,v]=await Promise.all([kiw('/products?page_size=20'),kiw(`/sales?start_date=${d(i)}&end_date=${d(f)}&page_size=50`)]);
+              const ps=lista(p),vs=lista(v);
+              S.loja=`<b>${ps.length}</b> produtos e <b>${vs.length}</b> vendas nos últimos 30 dias.<br><br>`+ps.slice(0,10).map(x=>'• '+esc(x.name||x.title||x.id)).join('<br>')}
+            catch(e){S.loja='<span class="err">'+esc(e.message)+'</span>'}S.busy=false;render()}
+
+          // ---------- Shopify (cria rascunho de produto) ----------
+          async function shop(q,v){const d=A.ler('sdom'),t=A.ler('stok');if(!d||!t)throw new Error('Cadastre a loja e o token da Shopify em Ajustes.');
+            const r=await http('POST',`https://${d}/admin/api/2025-01/graphql.json`,{'Content-Type':'application/json','X-Shopify-Access-Token':t},JSON.stringify({query:q,variables:v}));
+            if(r.status!==200)throw new Error('Shopify '+r.status+': '+String(r.body).slice(0,120));
+            const j=JSON.parse(r.body);if(j.errors)throw new Error(JSON.stringify(j.errors).slice(0,160));return j.data}
+          async function enviarShopify(id){const c=S.cursos.find(x=>x.id==id);toast('Enviando para a Shopify...');
+            try{const a=(await shop(`mutation($p:ProductCreateInput!){productCreate(product:$p){product{id variants(first:1){nodes{id}}}userErrors{message}}}`,
+                {p:{title:c.titulo,descriptionHtml:htmlCurso(c),status:'DRAFT',tags:['curso-digital','curso-ia']}})).productCreate;
+              if(a.userErrors.length)throw new Error(a.userErrors[0].message);
+              const b=(await shop(`mutation($i:ID!,$v:[ProductVariantsBulkInput!]!){productVariantsBulkUpdate(productId:$i,variants:$v){userErrors{message}}}`,
+                {i:a.product.id,v:[{id:a.product.variants.nodes[0].id,price:String(preco(c)),inventoryItem:{requiresShipping:false}}]})).productVariantsBulkUpdate;
+              if(b.userErrors.length)throw new Error(b.userErrors[0].message);
+              c.shopify=true;save();render();toast('Rascunho criado na Shopify')}
+            catch(e){toast('Erro: '+e.message)}}
+
+          // ---------- Telas ----------
+          function nav(){const t=[['chat','Chat'],['criar','Criar'],['cursos','Cursos ('+S.cursos.length+')'],['lojas','Lojas'],['cfg','Ajustes']];
+            $('#nav').innerHTML=t.map(([k,n])=>`<button class="${S.tab===k?'on':''}" onclick="S.tab='${k}';render()">${n}</button>`).join('')}
+          function render(){nav();({chat:vChat,criar:vCriar,cursos:vCursos,lojas:vLojas,cfg:vCfg})[S.tab]()}
+          function vChat(){
+            $('#main').innerHTML=`<div>${S.chat.length?S.chat.map(m=>`<div class="msg ${m.role==='user'?'u':'a'}">${esc(m.content)}</div>`).join(''):'<div class="card"><h3>Converse com a IA</h3><p class="mut">Peça ideias de produtos, nomes, títulos e estratégias de preço. Com a pesquisa ligada, a IA vê o que as pessoas realmente buscam no Google.</p></div>'}</div>
+            <div class="row"><span class="chip ${S.web?'on':''}" onclick="S.web=!S.web;render()">Pesquisar demanda</span><span class="chip" onclick="S.chat=[];save();render()">Limpar</span></div>
+            <div class="bar"><textarea id="in" rows="1" placeholder="Escreva aqui"></textarea><button class="go" id="sd" ${S.busy?'disabled':''}>Enviar</button></div>`;
+            $('#sd').onclick=enviar;$('#main').scrollTop=1e9}
+          async function enviar(){const v=$('#in').value.trim();if(!v||S.busy)return;S.chat.push({role:'user',content:v});S.busy=true;render();
+            try{let h=S.chat.slice(-10);if(S.web){const p=await pesquisar(v);h=[{role:'user',content:'Dados de pesquisa para usar na resposta:\n'+p},...h]}
+              S.chat.push({role:'assistant',content:await ia(h)})}catch(e){S.chat.push({role:'assistant',content:'Erro: '+e.message})}
+            S.busy=false;save();render()}
+          function vCriar(){
+            $('#main').innerHTML=`<div class="card"><h3>Criar curso original</h3><p class="mut">Pesquisa o que as pessoas buscam, acha as dúvidas reais e cria um curso novo com módulos, aulas, página de vendas, FAQ e anúncios.</p>
+            <label>Tema ou nicho</label><input id="tema" placeholder="Ex.: planilhas para organizar finanças">
+            <div class="row"><button class="go" id="b1" ${S.busy?'disabled':''}>Pesquisar e criar</button></div></div>
+            <div class="card"><h3>Piloto automático</h3><p class="mut">Pega temas com muita busca no Google Brasil e cria vários cursos em sequência. Mantenha o app aberto.</p>
+            <label>Quantidade</label><select id="qtd"><option>1</option><option selected>3</option><option>5</option></select>
+            <div class="row"><button class="go" id="b2" ${S.busy?'disabled':''}>Ligar piloto automático</button></div></div>
+            <div class="card ${S.busy?'pulse':''}"><div id="log" class="mut">${esc(S.log)||'Aguardando.'}</div></div>`;
+            $('#b1').onclick=()=>run([$('#tema').value.trim()]);$('#b2').onclick=()=>auto(+$('#qtd').value)}
+          function say(m){S.log=m;const l=$('#log');if(l)l.textContent=m}
+          async function run(temas){if(!temas[0])return toast('Digite um tema');S.busy=true;render();
+            try{for(const t of temas){say('Pesquisando: '+t+'...');const p=await pesquisar(t);say('Criando curso: '+t+'...');const c=await criar(t,p);S.cursos.unshift(c);save();say('Pronto: '+c.titulo)}
+              S.log='Concluído. Veja em Cursos.'}catch(e){S.log='Erro: '+e.message}
+            S.busy=false;render()}
+          async function auto(n){S.busy=true;render();
+            try{say('Buscando temas em alta...');
+              const sem=['como ganhar dinheiro com','curso online de','aprender','como começar a'];
+              const todas=[...new Set((await Promise.all(sem.map(sugestoes))).flat())].filter(x=>x.length>12);
+              const temas=todas.sort(()=>Math.random()-.5).slice(0,n);if(!temas.length)throw new Error('Não consegui buscar temas agora.');
+              S.busy=false;await run(temas)}catch(e){S.log='Erro: '+e.message;S.busy=false;render()}}
+          function vCursos(){
+            $('#main').innerHTML=S.cursos.length?S.cursos.map(c=>`<div class="card"><h3>${esc(c.titulo)}</h3><p class="mut">${esc(c.subtitulo)}</p>
+              <div class="row"><span class="price">R$ ${preco(c)}</span><span class="chip">${esc(c.tema)}</span>${c.shopify?'<span class="chip on">na Shopify</span>':''}</div>
+              <details><summary>Módulos e aulas</summary>${(c.modulos||[]).map(m=>`<p><b>${esc(m.nome)}</b></p>${(m.aulas||[]).map(a=>`<p class="mut">• ${esc(a.titulo)}</p>`).join('')}`).join('')}</details>
+              <details><summary>Página de vendas</summary><p class="mut" style="white-space:pre-wrap">${esc(c.pagina_vendas)}</p></details>
+              <details><summary>Anúncios</summary>${(c.anuncios||[]).map(a=>`<p class="mut">${esc(a)}</p>`).join('')}</details>
+              <div class="row"><button class="go" onclick="copiar(textoCurso(S.cursos.find(x=>x.id=='${c.id}')))">Copiar para Kiwify</button>
+              <button class="sec" onclick="enviarShopify('${c.id}')">Enviar à Shopify</button>
+              <button class="sec" onclick="S.cursos=S.cursos.filter(x=>x.id!='${c.id}');save();render()">Excluir</button></div></div>`).join('')
+              +`<p class="mut" style="padding:8px">Kiwify: crie o produto no painel e cole o conteúdo copiado. Shopify: o produto vai como rascunho, e você revisa e publica.</p>`
+              :'<div class="card"><h3>Nenhum curso ainda</h3><p class="mut">Vá em Criar e gere o primeiro.</p></div>'}
+          function vLojas(){
+            $('#main').innerHTML=`<div class="card"><h3>Kiwify</h3><p class="mut">Mostra seus produtos e as vendas dos últimos 30 dias. Somente leitura: o app não cria, reembolsa nem saca nada.</p>
+              <div class="row"><button class="go" id="kb" ${S.busy?'disabled':''}>Atualizar painel</button></div>
+              <p class="mut" style="margin-top:12px">${S.loja||'Cadastre suas credenciais em Ajustes.'}</p></div>
+              <div class="card"><h3>Shopify</h3><p class="mut">Em Cursos, toque em Enviar à Shopify para criar o produto como rascunho, com título, descrição e preço. Loja: <b>${esc(A.ler('sdom')||'não conectada')}</b></p>
+              <p class="mut" style="margin-top:8px">Para entregar o curso ao comprador, use um app de produtos digitais da Shopify.</p></div>`;
+            const b=$('#kb');if(b)b.onclick=painelKiwify}
+          function vCfg(){
+            const t=(id,l,ph,tipo='password')=>`<label>${l}</label><input id="${id}" type="${tipo}" placeholder="${A.ler(id)&&tipo==='password'?'Salvo no cofre do Android':ph}" ${tipo==='text'?`value="${esc(A.ler(id))}"`:''}>`;
+            $('#main').innerHTML=`<div class="card"><h3>Kiwify</h3>${t('kid','client_id','Painel da Kiwify > Apps > API')}${t('ksec','client_secret','Guarde com cuidado')}${t('kacc','ID da conta (se a Kiwify pedir)','Opcional','text')}</div>
+              <div class="card"><h3>Shopify</h3>${t('sdom','Loja','minha-loja.myshopify.com','text')}${t('stok','Token de acesso da Admin API','Escopo write_products')}</div>
+              <div class="card"><h3>IA gratuita</h3><label>Servidor</label><select id="ia"><option value="https://text.pollinations.ai/openai">Pollinations (sem chave)</option><option value="https://gen.pollinations.ai/v1/chat/completions">Pollinations gen (chave gratuita)</option></select>
+              ${t('pkey','Chave Pollinations (opcional)','Só para o servidor gen')}</div>
+              <div class="row"><button class="go" id="sv">Salvar</button></div><p class="mut" id="ms"></p>
+              <div class="card"><h3>Segurança</h3><p class="mut">O app só tem permissão de internet e só fala com: IA gratuita, buscas do Google, Wikipédia, Kiwify (somente leitura) e a sua loja Shopify. Não lê arquivos, contatos, outros apps nem dados bancários, e não existe campo de senha ou conta bancária. O dinheiro fica na Kiwify e na Shopify, e só você saca. Chaves ficam criptografadas no cofre do Android.</p></div>
+              <div class="card"><h3>Privacidade e limites</h3><p class="mut">A IA gratuita é um serviço de terceiros: seus temas e prompts passam por ele, então nunca escreva dados pessoais. Ele pode ficar lento, mudar ou sair do ar, e a qualidade é menor que a de IAs pagas. Revise todo curso antes de vender. O app não garante vendas.</p></div>`;
+            $('#ia').value=A.ler('ia')||'https://text.pollinations.ai/openai';
+            $('#sv').onclick=()=>{['kid','ksec','kacc','sdom','stok','pkey','ia'].forEach(k=>{let v=$('#'+k).value.trim();
+                if(k==='sdom')v=v.replace(/^https?:\/\//,'').replace(/\/.*$/,'').toLowerCase();
+                if(v||k==='kacc'||k==='ia')A.gravar(k,v)});KT=null;
+              $('#ms').innerHTML='<span class="ok">Salvo.</span>'}}
+          render();
+          </script></body></html>
+          HTML
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - name: Publicar APK em Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Curso IA v${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
